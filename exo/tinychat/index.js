@@ -13,7 +13,11 @@ document.addEventListener("alpine:init", () => {
     home: 0,
     generating: false,
     endpoint: `${window.location.origin}/v1`,
+    
+    // Initialize error message structure
     errorMessage: null,
+    errorExpanded: false,
+    errorTimeout: null,
 
     // performance tracking
     time_till_first: 0,
@@ -30,12 +34,81 @@ document.addEventListener("alpine:init", () => {
     // Pending message storage
     pendingMessage: null,
 
+    modelPoolInterval: null,
+
+    // Add models state alongside existing state
+    models: {},
+
     init() {
       // Clean up any pending messages
       localStorage.removeItem("pendingMessage");
 
+      // Get initial model list
+      this.fetchInitialModels();
+
       // Start polling for download progress
       this.startDownloadProgressPolling();
+      
+      // Start model polling with the new pattern
+      this.startModelPolling();
+    },
+
+    async fetchInitialModels() {
+      try {
+        const response = await fetch(`${window.location.origin}/initial_models`);
+        if (response.ok) {
+          const initialModels = await response.json();
+          this.models = initialModels;
+        }
+      } catch (error) {
+        console.error('Error fetching initial models:', error);
+      }
+    },
+
+    async startModelPolling() {
+      while (true) {
+        try {
+          await this.populateSelector();
+          // Wait 5 seconds before next poll
+          await new Promise(resolve => setTimeout(resolve, 5000));
+        } catch (error) {
+          console.error('Model polling error:', error);
+          // If there's an error, wait before retrying
+          await new Promise(resolve => setTimeout(resolve, 5000));
+        }
+      }
+    },
+
+    async populateSelector() {
+      return new Promise((resolve, reject) => {
+        const evtSource = new EventSource(`${window.location.origin}/modelpool`);
+        
+        evtSource.onmessage = (event) => {
+          if (event.data === "[DONE]") {
+            evtSource.close();
+            resolve();
+            return;
+          }
+          
+          const modelData = JSON.parse(event.data);
+          // Update existing model data while preserving other properties
+          Object.entries(modelData).forEach(([modelName, data]) => {
+            if (this.models[modelName]) {
+              this.models[modelName] = {
+                ...this.models[modelName],
+                ...data,
+                loading: false
+              };
+            }
+          });
+        };
+        
+        evtSource.onerror = (error) => {
+          console.error('EventSource failed:', error);
+          evtSource.close();
+          reject(error);
+        };
+      });
     },
 
     removeHistory(cstate) {
@@ -47,6 +120,12 @@ document.addEventListener("alpine:init", () => {
         localStorage.setItem("histories", JSON.stringify(this.histories));
       }
     },
+
+    clearAllHistory() {
+      this.histories = [];
+      localStorage.setItem("histories", JSON.stringify([]));
+    },
+
     // Utility functions
     formatBytes(bytes) {
       if (bytes === 0) return '0 B';
@@ -110,12 +189,8 @@ document.addEventListener("alpine:init", () => {
         localStorage.setItem("pendingMessage", value);
         this.processMessage(value);
       } catch (error) {
-        console.error('error', error)
-        this.lastErrorMessage = error.message || 'Unknown error on handleSend';
-        this.errorMessage = error.message || 'Unknown error on handleSend';
-        setTimeout(() => {
-          this.errorMessage = null;
-        }, 5 * 1000)
+        console.error('error', error);
+        this.setError(error);
         this.generating = false;
       }
     },
@@ -153,53 +228,110 @@ document.addEventListener("alpine:init", () => {
             };
           }
         });
-        const containsImage = apiMessages.some(msg => Array.isArray(msg.content) && msg.content.some(item => item.type === 'image_url'));
-        if (containsImage) {
-          // Map all messages with string content to object with type text
-          apiMessages = apiMessages.map(msg => {
-            if (typeof msg.content === 'string') {
-              return {
-                ...msg,
-                content: [
-                  {
-                    type: "text",
-                    text: msg.content
-                  }
-                ]
-              };
-            }
-            return msg;
+        
+        if (this.cstate.selectedModel === "stable-diffusion-2-1-base") {
+          // Send a request to the image generation endpoint
+          console.log(apiMessages[apiMessages.length - 1].content)
+          console.log(this.cstate.selectedModel)  
+          console.log(this.endpoint)
+          const response = await fetch(`${this.endpoint}/image/generations`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              "model": 'stable-diffusion-2-1-base',
+              "prompt": apiMessages[apiMessages.length - 1].content,
+              "image_url": this.imageUrl
+            }),
           });
-        }
-
-
-        // start receiving server sent events
-        let gottenFirstChunk = false;
-        for await (
-          const chunk of this.openaiChatCompletion(this.cstate.selectedModel, apiMessages)
-        ) {
-          if (!gottenFirstChunk) {
-            this.cstate.messages.push({ role: "assistant", content: "" });
-            gottenFirstChunk = true;
+      
+          if (!response.ok) {
+            throw new Error("Failed to fetch");
           }
-
-          // add chunk to the last message
-          this.cstate.messages[this.cstate.messages.length - 1].content += chunk;
-
-          // calculate performance tracking
-          tokens += 1;
-          this.total_tokens += 1;
-          if (start_time === 0) {
-            start_time = Date.now();
-            this.time_till_first = start_time - prefill_start;
-          } else {
-            const diff = Date.now() - start_time;
-            if (diff > 0) {
-              this.tokens_per_second = tokens / (diff / 1000);
+          const reader = response.body.getReader();
+          let done = false;
+          let gottenFirstChunk = false;
+  
+          while (!done) {
+            const { value, done: readerDone } = await reader.read();
+            done = readerDone;
+            const decoder = new TextDecoder();
+  
+            if (value) {
+              // Assume non-binary data (text) comes first
+              const chunk = decoder.decode(value, { stream: true });
+              const parsed = JSON.parse(chunk);
+              console.log(parsed)
+  
+              if (parsed.progress) {
+                if (!gottenFirstChunk) {
+                  this.cstate.messages.push({ role: "assistant", content: "" });
+                  gottenFirstChunk = true;
+                }
+                this.cstate.messages[this.cstate.messages.length - 1].content = parsed.progress;
+              }
+              else if (parsed.images) {
+                if (!gottenFirstChunk) {
+                  this.cstate.messages.push({ role: "assistant", content: "" });
+                  gottenFirstChunk = true;
+                }
+                const imageUrl = parsed.images[0].url;
+                console.log(imageUrl)
+                this.cstate.messages[this.cstate.messages.length - 1].content = `![Generated Image](${imageUrl}?t=${Date.now()})`;
+              }
             }
           }
         }
+        
+        else{        
+          const containsImage = apiMessages.some(msg => Array.isArray(msg.content) && msg.content.some(item => item.type === 'image_url'));
+          if (containsImage) {
+            // Map all messages with string content to object with type text
+            apiMessages = apiMessages.map(msg => {
+              if (typeof msg.content === 'string') {
+                return {
+                  ...msg,
+                  content: [
+                    {
+                      type: "text",
+                      text: msg.content
+                    }
+                  ]
+                };
+              }
+              return msg;
+            });
+          }
 
+          console.log(apiMessages)
+          //start receiving server sent events
+          let gottenFirstChunk = false;
+          for await (
+            const chunk of this.openaiChatCompletion(this.cstate.selectedModel, apiMessages)
+          ) {
+            if (!gottenFirstChunk) {
+              this.cstate.messages.push({ role: "assistant", content: "" });
+              gottenFirstChunk = true;
+            }
+
+            // add chunk to the last message
+            this.cstate.messages[this.cstate.messages.length - 1].content += chunk;
+
+            // calculate performance tracking
+            tokens += 1;
+            this.total_tokens += 1;
+            if (start_time === 0) {
+              start_time = Date.now();
+              this.time_till_first = start_time - prefill_start;
+            } else {
+              const diff = Date.now() - start_time;
+              if (diff > 0) {
+                this.tokens_per_second = tokens / (diff / 1000);
+              }
+            }
+          }
+        }
         // Clean the cstate before adding it to histories
         const cleanedCstate = JSON.parse(JSON.stringify(this.cstate));
         cleanedCstate.messages = cleanedCstate.messages.map(msg => {
@@ -232,12 +364,8 @@ document.addEventListener("alpine:init", () => {
           console.error("Failed to save histories to localStorage:", error);
         }
       } catch (error) {
-        console.error('error', error)
-        this.lastErrorMessage = error;
-        this.errorMessage = error;
-        setTimeout(() => {
-          this.errorMessage = null;
-        }, 5 * 1000)
+        console.error('error', error);
+        this.setError(error);
       } finally {
         this.generating = false;
       }
@@ -373,6 +501,106 @@ document.addEventListener("alpine:init", () => {
         this.fetchDownloadProgress();
       }, 1000); // Poll every second
     },
+
+    // Add a helper method to set errors consistently
+    setError(error) {
+      this.errorMessage = {
+        basic: error.message || "An unknown error occurred",
+        stack: error.stack || ""
+      };
+      this.errorExpanded = false;
+      
+      if (this.errorTimeout) {
+        clearTimeout(this.errorTimeout);
+      }
+
+      if (!this.errorExpanded) {
+        this.errorTimeout = setTimeout(() => {
+          this.errorMessage = null;
+          this.errorExpanded = false;
+        }, 30 * 1000);
+      }
+    },
+
+    async deleteModel(modelName, model) {
+      const downloadedSize = model.total_downloaded || 0;
+      const sizeMessage = downloadedSize > 0 ? 
+        `This will free up ${this.formatBytes(downloadedSize)} of space.` :
+        'This will remove any partially downloaded files.';
+      
+      if (!confirm(`Are you sure you want to delete ${model.name}? ${sizeMessage}`)) {
+        return;
+      }
+
+      try {
+        const response = await fetch(`${window.location.origin}/models/${modelName}`, {
+          method: 'DELETE',
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        });
+
+        const data = await response.json();
+        
+        if (!response.ok) {
+          throw new Error(data.detail || 'Failed to delete model');
+        }
+
+        // Update the model status in the UI
+        if (this.models[modelName]) {
+          this.models[modelName].downloaded = false;
+          this.models[modelName].download_percentage = 0;
+          this.models[modelName].total_downloaded = 0;
+        }
+
+        // If this was the selected model, switch to a different one
+        if (this.cstate.selectedModel === modelName) {
+          const availableModel = Object.keys(this.models).find(key => this.models[key].downloaded);
+          this.cstate.selectedModel = availableModel || 'llama-3.2-1b';
+        }
+
+        // Show success message
+        console.log(`Model deleted successfully from: ${data.path}`);
+
+        // Refresh the model list
+        await this.populateSelector();
+      } catch (error) {
+        console.error('Error deleting model:', error);
+        this.setError(error.message || 'Failed to delete model');
+      }
+    },
+
+    async handleDownload(modelName) {
+      try {
+        const response = await fetch(`${window.location.origin}/download`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            model: modelName
+          })
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.error || 'Failed to start download');
+        }
+
+        // Update the model's status immediately when download starts
+        if (this.models[modelName]) {
+          this.models[modelName] = {
+            ...this.models[modelName],
+            loading: true
+          };
+        }
+
+      } catch (error) {
+        console.error('Error starting download:', error);
+        this.setError(error);
+      }
+    }
   }));
 });
 
@@ -529,6 +757,7 @@ function createParser(onParse) {
     }
   }
 }
+
 const BOM = [239, 187, 191];
 function hasBom(buffer) {
   return BOM.every((charCode, index) => buffer.charCodeAt(index) === charCode);
